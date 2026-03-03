@@ -358,7 +358,7 @@ def generate_dataset(
         labels, edges, and formation metadata.
     """
     os.makedirs("datasets", exist_ok=True)
-    dataset_path = f"datasets/{dataset_name}_{dataset_type}.npz"
+    dataset_path = f"../datasets/{dataset_name}_{dataset_type}.npz"
 
     all_states = []
     all_targets = []
