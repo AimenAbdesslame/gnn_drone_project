@@ -1,30 +1,52 @@
-import os
+# Auto-generated from data_collection_notebook.ipynb
+# This script preserves notebook cell order and content in a Python-friendly format.
+
+# %% [markdown]
+# # Data Collection Notebook
+#
+# This notebook version of `data_collection.py` keeps the same dataset-generation logic while splitting it into smaller sections that are easier to inspect, modify, and run incrementally.
+#
+# It includes:
+# - PyTorch Geometric `.pt` export
+# - episode-level train/val/test splits
+# - tapered temporal sampling
+# - rollout metadata per graph
+# - a JSON sidecar describing the dataset recipe
+
+# %%
 import json
+import os
+
 import numpy as np
 import pybullet as p
 import torch
-from torch_geometric.data import Data, InMemoryDataset
 from PyFlyt.core import Aviary
+from torch_geometric.data import Data, InMemoryDataset
 
+# %% [markdown]
+# ## Global Constants
+#
+# This cell defines formation labels and split-specific seed offsets. The split offsets make validation and test episodes use different random streams from training even when you start from one base seed.
 
+# %%
 FORMATION_NAMES = ("a", "rectangle", "triangle")
 FORMATION_TO_ID = {name: idx for idx, name in enumerate(FORMATION_NAMES)}
 SPLIT_NAMES = ("train", "val", "test")
 SPLIT_SEED_OFFSETS = {"train": 0, "val": 1_000_000, "test": 2_000_000}
 
+# %% [markdown]
+# ## Wind and Episode Initialization
+#
+# These helpers generate a simple wind field and sample randomized initial conditions for each episode. The initialization function accepts a NumPy random generator so each episode can be reproduced from a seed.
 
-# Define a simple wind function matching what you see in example 09
+
+# %%
 def wind_generator(time: float, position: np.ndarray):
     """Generates an upward draft with random turbulence."""
     wind = np.zeros_like(position)
-    
-    # Give a base updraft force plus randomness based on position
     wind[:, 2] = np.sin(time) * 0.5 + np.random.normal(0, 0.2, size=(len(position),))
-    
-    # Push slightly horizontally 
     wind[:, 0] = np.cos(time / 2.0) * 0.3
     wind[:, 1] = np.sin(time / 2.0) * 0.3
-    
     return wind
 
 
@@ -35,11 +57,12 @@ def sample_episode_initial_conditions(
     altitude_range: tuple[float, float] = (0.5, 5.0),
 ):
     start_pos = rng.uniform(-xy_limit, xy_limit, size=(num_drones, 3))
-    start_pos[:, 2] = rng.uniform(altitude_range[0], altitude_range[1], size=(num_drones,))
+    start_pos[:, 2] = rng.uniform(
+        altitude_range[0], altitude_range[1], size=(num_drones,)
+    )
 
     start_orn = np.zeros((num_drones, 3))
     start_orn[:, 2] = rng.uniform(-np.pi, np.pi, size=(num_drones,))
-
     return start_pos, start_orn
 
 
@@ -53,6 +76,13 @@ def resolve_formation_name(dataset_type: str):
     return None
 
 
+# %% [markdown]
+# ## Formation Geometry
+#
+# These helpers define how each formation is laid out in the XY plane. The setpoints are centered around the episode's mean initial position so the swarm moves into formation without teleporting the target far away from the sampled scenario.
+
+
+# %%
 def _formation_a_offsets(num_drones: int, spacing: float = 2.0):
     offsets = np.zeros((num_drones, 3))
     if num_drones == 1:
@@ -127,6 +157,13 @@ def _build_formation_setpoints(formation_name: str, start_pos: np.ndarray):
     return setpoints
 
 
+# %% [markdown]
+# ## Environment Creation and Setpoint Generation
+#
+# This part creates the PyFlyt `Aviary`, enables optional wind, and generates setpoints for either a formation task or a generic random-hovering style task.
+
+
+# %%
 def create_aviary(
     start_pos: np.ndarray,
     start_orn: np.ndarray,
@@ -171,74 +208,21 @@ def build_setpoints(
 
     radius = 10.0 if dataset_type == "aggressive" else 5.0
     setpoints = np.zeros((num_drones, 4))
-    setpoints[:, :2] = start_pos[:, :2] + rng.uniform(-radius, radius, size=(num_drones, 2))
+    setpoints[:, :2] = start_pos[:, :2] + rng.uniform(
+        -radius, radius, size=(num_drones, 2)
+    )
     setpoints[:, 2] = rng.uniform(-np.pi, np.pi, size=(num_drones,))
     setpoints[:, 3] = rng.uniform(1.0, radius, size=(num_drones,))
     return setpoints
 
 
-def compute_split_episode_counts(
-    num_episodes: int,
-    split_ratios: tuple[float, float, float],
-):
-    if len(split_ratios) != 3:
-        raise ValueError("split_ratios must contain exactly three values for train, val, test.")
-    if not np.isclose(sum(split_ratios), 1.0):
-        raise ValueError("split_ratios must sum to 1.0.")
-
-    counts = [int(num_episodes * ratio) for ratio in split_ratios]
-    remainder = num_episodes - sum(counts)
-    for idx in range(remainder):
-        counts[idx] += 1
-
-    return {split_name: count for split_name, count in zip(SPLIT_NAMES, counts)}
+# %% [markdown]
+# ## State Processing and Graph Construction
+#
+# These helpers transform raw drone state into graph node features, target vectors, and communication edges. This is the part that turns the simulator rollout into supervised learning samples for the GNN.
 
 
-def resolve_split_spread_scale(
-    split_name: str,
-    validation_spread_scale: float,
-    test_spread_scale: float,
-):
-    if split_name == "val":
-        return validation_spread_scale
-    if split_name == "test":
-        return test_spread_scale
-    return 1.0
-
-
-def should_sample_step(
-    step_idx: int,
-    max_steps: int,
-    tapered_sampling: bool,
-    dense_sampling_steps: int,
-    mid_sampling_steps: int,
-    mid_step_stride: int,
-    late_step_stride: int,
-):
-    if not tapered_sampling or step_idx == max_steps - 1:
-        return True
-
-    mid_sampling_steps = max(mid_sampling_steps, dense_sampling_steps)
-
-    if step_idx < dense_sampling_steps:
-        return True
-    if step_idx < mid_sampling_steps:
-        return (step_idx - dense_sampling_steps) % mid_step_stride == 0
-    return (step_idx - mid_sampling_steps) % late_step_stride == 0
-
-
-def build_episode_seed(seed: int | None, split_name: str, split_episode_idx: int):
-    if seed is None:
-        return None
-    return int(seed + SPLIT_SEED_OFFSETS[split_name] + split_episode_idx)
-
-
-def write_dataset_metadata(metadata_path: str, metadata: dict):
-    with open(metadata_path, "w", encoding="ascii") as metadata_file:
-        json.dump(metadata, metadata_file, indent=2)
-        metadata_file.write("\n")
-
-
+# %%
 def maybe_add_sensor_noise(
     global_pos: np.ndarray,
     global_euler: np.ndarray,
@@ -332,13 +316,15 @@ def collect_step_data(
     global_positions = []
 
     for i, drone in enumerate(env.drones):
-        gnn_input_state, gnn_input_target, motor_pwm_labels, global_pos = build_drone_features(
-            drone,
-            setpoints[i],
-            noisy_sensors,
-            noise_variance,
-            formation_one_hot,
-            include_formation_in_state,
+        gnn_input_state, gnn_input_target, motor_pwm_labels, global_pos = (
+            build_drone_features(
+                drone,
+                setpoints[i],
+                noisy_sensors,
+                noise_variance,
+                formation_one_hot,
+                include_formation_in_state,
+            )
         )
         episode_states.append(gnn_input_state)
         episode_targets.append(gnn_input_target)
@@ -347,6 +333,81 @@ def collect_step_data(
 
     edges = build_edges(np.array(global_positions), communication_radius)
     return episode_states, episode_targets, episode_labels, edges
+
+
+# %% [markdown]
+# ## Split Logic, Tapered Sampling, and Metadata
+#
+# This section implements the practical dataset design choices discussed earlier:
+# - split by episode rather than by graph
+# - use separate seed streams for train, val, and test
+# - optionally save more steps early and fewer later
+# - write a metadata sidecar so the dataset recipe is reproducible
+
+
+# %%
+def compute_split_episode_counts(
+    num_episodes: int,
+    split_ratios: tuple[float, float, float],
+):
+    if len(split_ratios) != 3:
+        raise ValueError(
+            "split_ratios must contain exactly three values for train, val, test."
+        )
+    if not np.isclose(sum(split_ratios), 1.0):
+        raise ValueError("split_ratios must sum to 1.0.")
+
+    counts = [int(num_episodes * ratio) for ratio in split_ratios]
+    remainder = num_episodes - sum(counts)
+    for idx in range(remainder):
+        counts[idx] += 1
+
+    return {split_name: count for split_name, count in zip(SPLIT_NAMES, counts)}
+
+
+def resolve_split_spread_scale(
+    split_name: str,
+    validation_spread_scale: float,
+    test_spread_scale: float,
+):
+    if split_name == "val":
+        return validation_spread_scale
+    if split_name == "test":
+        return test_spread_scale
+    return 1.0
+
+
+def should_sample_step(
+    step_idx: int,
+    max_steps: int,
+    tapered_sampling: bool,
+    dense_sampling_steps: int,
+    mid_sampling_steps: int,
+    mid_step_stride: int,
+    late_step_stride: int,
+):
+    if not tapered_sampling or step_idx == max_steps - 1:
+        return True
+
+    mid_sampling_steps = max(mid_sampling_steps, dense_sampling_steps)
+
+    if step_idx < dense_sampling_steps:
+        return True
+    if step_idx < mid_sampling_steps:
+        return (step_idx - dense_sampling_steps) % mid_step_stride == 0
+    return (step_idx - mid_sampling_steps) % late_step_stride == 0
+
+
+def build_episode_seed(seed: int | None, split_name: str, split_episode_idx: int):
+    if seed is None:
+        return None
+    return int(seed + SPLIT_SEED_OFFSETS[split_name] + split_episode_idx)
+
+
+def write_dataset_metadata(metadata_path: str, metadata: dict):
+    with open(metadata_path, "w", encoding="ascii") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2)
+        metadata_file.write("\n")
 
 
 def save_dataset(
@@ -367,16 +428,23 @@ def save_dataset(
     )
 
 
+# %% [markdown]
+# ## Main Dataset Generator
+#
+# This is the full generation loop. It creates split-specific episodes, applies the tapered sampling policy, stores one PyG graph per retained step, and writes both split files and a metadata JSON file.
+
+
+# %%
 def generate_dataset(
     num_episodes=200,
     max_steps=300,
     dataset_name="formation_dataset",
-    dataset_type="mixed_formations",  # 'random', 'hovering', 'aggressive', 'a', 'rectangle', 'triangle', 'mixed_formations'
+    dataset_type="mixed_formations",
     noisy_sensors=False,
     noise_variance=0.01,
     environmental_wind=False,
     graphical=False,
-    communication_radius=np.inf,  # For edge formation
+    communication_radius=np.inf,
     include_formation_in_state=True,
     mixed_formation_types=FORMATION_NAMES,
     split_ratios=(0.8, 0.1, 0.1),
@@ -391,100 +459,17 @@ def generate_dataset(
     mid_step_stride=2,
     late_step_stride=5,
 ):
-    """
-    Generate a multi-drone imitation-learning dataset from the PyFlyt PID controller.
-
-    The simulator runs at the controller loop rate (120 Hz), and each collected sample
-    contains node features, local target errors, PWM labels, and graph edges.
-    Data is represented in local body-frame conventions (ENU-aligned state usage).
-
-    Parameters
-    ----------
-    num_episodes : int, default=200
-        Number of episodes to simulate.
-    max_steps : int, default=300
-        Number of simulation steps collected per episode.
-    dataset_name : str, default="formation_dataset"
-        Base name used in the output file path:
-        ``datasets/{dataset_name}_{dataset_type}_{split}.pt``.
-    dataset_type : str, default="mixed_formations"
-        Task/setpoint mode for each episode.
-        Supported values include:
-        - ``random``: random nearby targets.
-        - ``hovering``: hold current position/yaw.
-        - ``aggressive``: wider random target range.
-        - ``a``, ``rectangle``, ``triangle``: fixed geometric formations.
-        - ``mixed_formations`` (also ``mixed``, ``formations``): choose one
-          formation type randomly per episode from ``mixed_formation_types``.
-    noisy_sensors : bool, default=False
-        If True, adds Gaussian noise to position, Euler angle, linear velocity,
-        and angular velocity before building model inputs.
-    noise_variance : float, default=0.01
-        Standard deviation used for Gaussian sensor noise when
-        ``noisy_sensors=True``.
-    environmental_wind : bool, default=False
-        If True, registers ``wind_generator`` as an external wind field in Aviary.
-    graphical : bool, default=False
-        If True, runs episodes with the PyBullet GUI enabled (rendering visible).
-        If False, runs headless for faster data collection.
-    communication_radius : float, default=np.inf
-        Maximum inter-drone distance for adding directed communication edges.
-        Use ``np.inf`` for fully connected (excluding self-loops).
-    include_formation_in_state : bool, default=True
-        If True, concatenates a formation one-hot vector to each node state when
-        the active episode uses a recognized formation.
-    mixed_formation_types : tuple[str, ...], default=FORMATION_NAMES
-        Candidate formation names sampled in mixed mode. Typical values:
-        ``("a", "rectangle", "triangle")``.
-    split_ratios : tuple[float, float, float], default=(0.8, 0.1, 0.1)
-        Episode-level split ratios for train, validation, and test datasets.
-        Splitting is done by episode, never by individual graph.
-    seed : int | None, default=12345
-        Base seed used to derive per-split unseen episode seeds.
-    base_xy_limit : float, default=10.0
-        Base XY spawn range for training episodes.
-    altitude_range : tuple[float, float], default=(0.5, 5.0)
-        Inclusive altitude sampling range for episode initialization.
-    validation_spread_scale : float, default=1.25
-        Multiplier applied to ``base_xy_limit`` for validation episodes.
-        This creates harder validation subsets with larger initial spreads.
-    test_spread_scale : float, default=1.5
-        Multiplier applied to ``base_xy_limit`` for test episodes.
-    tapered_sampling : bool, default=True
-        If True, save more steps early in the rollout and fewer after convergence.
-    dense_sampling_steps : int, default=120
-        Number of initial steps kept at full resolution when tapered sampling is enabled.
-    mid_sampling_steps : int, default=240
-        Absolute step index where sampling switches from the mid stride to the late stride.
-    mid_step_stride : int, default=2
-        Save every ``mid_step_stride`` step between ``dense_sampling_steps`` and
-        ``mid_sampling_steps``.
-    late_step_stride : int, default=5
-        Save every ``late_step_stride`` step after ``mid_sampling_steps``.
-
-    Returns
-    -------
-    None
-        Writes PyTorch Geometric ``.pt`` datasets to disk with collated
-        ``Data`` objects for train, validation, and test splits. Each graph contains:
-        - ``x``: node features,
-        - ``target``: local target errors,
-        - ``y``: PWM labels,
-        - ``edge_index``: graph connectivity,
-        - ``formation_id``: graph-level formation class id,
-        - ``episode_id``: global rollout identifier,
-        - ``step_idx``: step index within the rollout,
-        - ``num_drones``: number of drones in the rollout.
-        A JSON sidecar is also written to describe the exact generation recipe.
-    """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_dir = os.path.dirname(
+        os.path.abspath(os.getcwd() if "__file__" not in globals() else __file__)
+    )
     repo_root = os.path.dirname(script_dir)
     datasets_dir = os.path.join(repo_root, "datasets")
     os.makedirs(datasets_dir, exist_ok=True)
+
     dataset_prefix = os.path.join(datasets_dir, f"{dataset_name}_{dataset_type}")
     split_episode_counts = compute_split_episode_counts(num_episodes, split_ratios)
     split_graphs = {split_name: [] for split_name in SPLIT_NAMES}
-    split_summaries = dict()
+    split_summaries = {}
     episode_records = []
 
     global_episode_id = 0
@@ -528,14 +513,11 @@ def generate_dataset(
             formation_id = -1
             if formation_name is not None:
                 formation_id = FORMATION_TO_ID[formation_name]
+
             formation_one_hot = None
             if formation_id >= 0:
                 formation_one_hot = np.zeros(len(FORMATION_NAMES), dtype=np.float32)
                 formation_one_hot[formation_id] = 1.0
-
-            print(
-                f"[{dataset_name}] {split_name} episode {split_episode_idx + 1} formation = {formation_name if formation_name is not None else episode_dataset_type}"
-            )
 
             env.set_all_setpoints(setpoints)
 
@@ -550,22 +532,28 @@ def generate_dataset(
                     mid_step_stride,
                     late_step_stride,
                 ):
-                    episode_states, episode_targets, episode_labels, edges = collect_step_data(
-                        env,
-                        setpoints,
-                        noisy_sensors,
-                        noise_variance,
-                        communication_radius,
-                        formation_one_hot,
-                        include_formation_in_state,
+                    episode_states, episode_targets, episode_labels, edges = (
+                        collect_step_data(
+                            env,
+                            setpoints,
+                            noisy_sensors,
+                            noise_variance,
+                            communication_radius,
+                            formation_one_hot,
+                            include_formation_in_state,
+                        )
                     )
 
                     x = torch.as_tensor(np.asarray(episode_states), dtype=torch.float32)
-                    target = torch.as_tensor(np.asarray(episode_targets), dtype=torch.float32)
+                    target = torch.as_tensor(
+                        np.asarray(episode_targets), dtype=torch.float32
+                    )
                     y = torch.as_tensor(np.asarray(episode_labels), dtype=torch.float32)
 
                     if edges:
-                        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+                        edge_index = (
+                            torch.tensor(edges, dtype=torch.long).t().contiguous()
+                        )
                     else:
                         edge_index = torch.empty((2, 0), dtype=torch.long)
 
@@ -607,20 +595,15 @@ def generate_dataset(
             )
             global_episode_id += 1
 
-    generated_files = dict()
+    generated_files = {}
     for split_name, graphs in split_graphs.items():
         if not graphs:
             continue
 
         split_dataset_path = f"{dataset_prefix}_{split_name}.pt"
-        save_dataset(
-            split_dataset_path,
-            graphs,
-            FORMATION_NAMES,
-            split_name,
-        )
+        save_dataset(split_dataset_path, graphs, FORMATION_NAMES, split_name)
         generated_files[split_name] = os.path.basename(split_dataset_path)
-        print(f"✅ Generated {split_name} dataset -> {split_dataset_path}")
+        print(f"Generated {split_name} dataset -> {split_dataset_path}")
 
     metadata_path = f"{dataset_prefix}_metadata.json"
     metadata = {
@@ -654,17 +637,213 @@ def generate_dataset(
         "episodes": episode_records,
     }
     write_dataset_metadata(metadata_path, metadata)
-    print(f"✅ Generated dataset metadata -> {metadata_path}")
+    print(f"Generated dataset metadata -> {metadata_path}")
+
+    return generated_files, metadata_path
 
 
-if __name__ == "__main__":
-    # Generate a mixed-formation dataset with episode-level splits and tapered sampling.
-    generate_dataset(
-        num_episodes=240,
-        max_steps=300,
-        dataset_name="formation_mixed_comm_10m",
-        dataset_type="mixed_formations",
-        communication_radius=10.0,
-        include_formation_in_state=True,
-        tapered_sampling=True,
+# %% [markdown]
+# ## Example Usage
+#
+# The final cell shows a practical default configuration. Leave it commented if you only want the notebook as documentation, or run it to generate split `.pt` files and the metadata JSON.
+
+# %%
+# Example generation call
+generated_files, metadata_path = generate_dataset(
+    num_episodes=240,
+    max_steps=300,
+    dataset_name="formation_mixed_comm_10m",
+    dataset_type="mixed_formations",
+    communication_radius=10.0,
+    include_formation_in_state=True,
+    tapered_sampling=True,
+)
+print(generated_files)
+print(metadata_path)
+
+# %% [markdown]
+# ## Inspect a Generated Split
+#
+#
+#
+# This section uses a small PyTorch Geometric `InMemoryDataset` wrapper to load one generated split exactly the way a PyG training pipeline would. It reconstructs the dataset, inspects one sample graph, and then shows how PyG batches graphs with a `DataLoader`.
+
+# %%
+from pathlib import Path
+
+from torch_geometric.loader import DataLoader
+
+
+class GeneratedSplitDataset(InMemoryDataset):
+    def __init__(self, split_path: str | Path):
+
+        self.split_path = Path(split_path)
+
+        payload = torch.load(self.split_path)
+
+        self.formation_names = payload.get("formation_names", [])
+
+        self.split_name = payload.get("split_name", "unknown")
+
+        super().__init__(root="")
+
+        self.data = payload["data"]
+
+        self.slices = payload["slices"]
+
+
+inspect_dataset_name = "formation_mixed_comm_10m_mixed_formations"
+
+inspect_split_name = "train"
+
+
+notebook_dir = Path.cwd()
+
+datasets_dir = notebook_dir.parent / "datasets"
+
+
+split_path = datasets_dir / f"{inspect_dataset_name}_{inspect_split_name}.pt"
+
+metadata_path = datasets_dir / f"{inspect_dataset_name}_metadata.json"
+
+
+if not split_path.exists():
+    raise FileNotFoundError(
+        f"Could not find split dataset at {split_path}. Generate the dataset first or update inspect_dataset_name."
     )
+
+
+dataset = GeneratedSplitDataset(split_path)
+
+
+print(f"Loaded split file: {split_path.name}")
+
+print(f"Stored split name: {dataset.split_name}")
+
+print(f"Available formation names: {dataset.formation_names}")
+
+print(f"Number of graphs: {len(dataset)}")
+
+
+sample_graph = dataset[0]
+
+print("\nSample graph summary:")
+
+print(sample_graph)
+
+print(f"x shape: {tuple(sample_graph.x.shape)}")
+
+print(f"target shape: {tuple(sample_graph.target.shape)}")
+
+print(f"y shape: {tuple(sample_graph.y.shape)}")
+
+print(f"edge_index shape: {tuple(sample_graph.edge_index.shape)}")
+
+print(f"episode_id: {int(sample_graph.episode_id.item())}")
+
+print(f"step_idx: {int(sample_graph.step_idx.item())}")
+
+print(f"num_drones: {int(sample_graph.num_drones.item())}")
+
+print(f"formation_id: {int(sample_graph.formation_id.item())}")
+
+
+loader = DataLoader(dataset, batch_size=4, shuffle=False)
+
+batch = next(iter(loader))
+
+print("\nPyG batch summary:")
+
+print(batch)
+
+print(f"batched x shape: {tuple(batch.x.shape)}")
+
+print(f"batched edge_index shape: {tuple(batch.edge_index.shape)}")
+
+print(f"batch vector shape: {tuple(batch.batch.shape)}")
+
+print(f"graphs in batch: {batch.num_graphs}")
+
+
+if metadata_path.exists():
+    with open(metadata_path, "r", encoding="ascii") as metadata_file:
+        metadata = json.load(metadata_file)
+
+    print("\nMetadata summary:")
+
+    print(f"Metadata file: {metadata_path.name}")
+
+    print(f"Configured dataset type: {metadata['dataset_type']}")
+
+    print(f"Configured split files: {metadata['generated_files']}")
+
+    print(f"Split summary: {metadata['split_summary'][inspect_split_name]}")
+
+    print(f"First episode record: {metadata['episodes'][0]}")
+
+else:
+    print(f"\nNo metadata file found at {metadata_path}")
+
+# %% [markdown]
+# ## Upload a Dataset to Google Drive
+#
+#
+#
+# This section is intended for Google Colab. It mounts Google Drive and copies the generated split files and metadata JSON into `MyDrive/dataset/<dataset-name>/`. Update the dataset name if you want to upload a different generated dataset bundle.
+
+# %%
+import shutil
+from pathlib import Path
+
+upload_dataset_name = "formation_mixed_comm_10m_mixed_formations"
+
+google_drive_root = Path("/content/drive/MyDrive")
+
+google_drive_dataset_dir = google_drive_root / "dataset" / upload_dataset_name
+
+
+try:
+    from google.colab import drive
+
+except ImportError as exc:
+    raise RuntimeError(
+        "This upload cell is intended to run in Google Colab, where google.colab is available."
+    ) from exc
+
+
+drive.mount("/content/drive", force_remount=False)
+
+
+local_datasets_dir = Path.cwd().parent / "datasets"
+
+google_drive_dataset_dir.mkdir(parents=True, exist_ok=True)
+
+
+artifacts_to_copy = sorted(local_datasets_dir.glob(f"{upload_dataset_name}*.pt"))
+
+metadata_file = local_datasets_dir / f"{upload_dataset_name}_metadata.json"
+
+if metadata_file.exists():
+    artifacts_to_copy.append(metadata_file)
+
+
+if not artifacts_to_copy:
+    raise FileNotFoundError(
+        f"No dataset artifacts found for {upload_dataset_name} in {local_datasets_dir}."
+    )
+
+
+copied_files = []
+
+for artifact_path in artifacts_to_copy:
+    destination_path = google_drive_dataset_dir / artifact_path.name
+
+    shutil.copy2(artifact_path, destination_path)
+
+    copied_files.append(destination_path)
+
+
+print(f"Uploaded {len(copied_files)} files to {google_drive_dataset_dir}")
+
+for copied_file in copied_files:
+    print(f" - {copied_file.name}")
