@@ -6,6 +6,7 @@
 !/datasets/
 !/gnn/
 !/data_collection.md
+!/visualization 
 !/.gitignore
 
 # Ignore files inside datasets, but keep the folder if there's a .gitkeep or similar
