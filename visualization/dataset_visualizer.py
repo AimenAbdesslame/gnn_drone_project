@@ -19,7 +19,7 @@ def visualize_episode_timelapse(
         dataset: A PyTorch Geometric dataset or list of Data/HeteroData objects.
         episode_id: The ID of the episode to visualize.
         title: The title of the plot.
-        view_2d: If True, plots Z vs X view. If False, plots full 3D.
+        view_2d: If True, plots Y vs X (top-down) view. If False, plots full 3D.
         
     Returns:
         go.Figure: A Plotly interactive figure with a sequence slider.
@@ -105,24 +105,24 @@ def visualize_episode_timelapse(
             slot_x, slot_y, slot_z = slots[:, 0], slots[:, 1], slots[:, 2] if slots.shape[1] > 2 else np.zeros_like(slots[:, 0])
 
         if view_2d:
-             # X-Z View
+             # X-Y View
              frame_data = [
                 # Edges
-                go.Scatter(x=edges_x, y=edges_z, mode='lines', line=dict(color='rgba(150,150,150,0.5)', width=1), hoverinfo='none', name="Comm Link"),
-                # Obstacles (vertical cylinders mapped to Z=all)
-                go.Scatter(x=obs_x, y=np.zeros_like(obs_x), mode='markers', marker=dict(symbol='square', size=20, color='red', opacity=0.3), name="Obstacle Base", hoverinfo='none'),
+                go.Scatter(x=edges_x, y=edges_y, mode='lines', line=dict(color='rgba(150,150,150,0.5)', width=1), hoverinfo='none', name="Comm Link"),
+                # Obstacles
+                go.Scatter(x=obs_x, y=obs_y, mode='markers', marker=dict(symbol='square', size=20, color='red', opacity=0.3), name="Obstacles", hoverinfo='none'),
                 # Target Slots
-                go.Scatter(x=slot_x, y=slot_z, mode='markers', marker=dict(symbol='cross', size=8, color='green', opacity=0.6), name="Target Slots", hoverinfo='none'),
+                go.Scatter(x=slot_x, y=slot_y, mode='markers', marker=dict(symbol='cross', size=8, color='green', opacity=0.6), name="Target Slots", hoverinfo='none'),
                 # Nodes
                 go.Scatter(
-                    x=pos[:, 0], y=pos[:, 2], 
+                    x=pos[:, 0], y=pos[:, 1], 
                     mode='markers+text', 
                     marker=dict(size=12, color='rgba(0,114,239,0.8)', line=dict(width=2, color='DarkSlateGrey')),
                     text=[f"{n}" for n in range(len(pos))],
                     textposition="top center",
                     name="Drones",
                     hoverinfo='text',
-                    hovertext=[f"Drone: {n}<br>X: {p[0]:.2f}<br>Z: {p[2]:.2f}" for n, p in enumerate(pos)]
+                    hovertext=[f"Drone: {n}<br>X: {p[0]:.2f}<br>Y: {p[1]:.2f}" for n, p in enumerate(pos)]
                 )
              ]
         else:
@@ -170,7 +170,7 @@ def visualize_episode_timelapse(
         fig.update_layout(
             title=title,
             xaxis=dict(range=[min_x, max_x], title="X Position"),
-            yaxis=dict(range=[min_z, max_z], title="Z Position (Altitude)", scaleanchor="x", scaleratio=1),
+            yaxis=dict(range=[min_y, max_y], title="Y Position", scaleanchor="x", scaleratio=1),
             sliders=sliders,
             updatemenus=[dict(type='buttons', showactive=False, y=0, x=-0.05,
                              buttons=[dict(label='Play',
@@ -186,7 +186,11 @@ def visualize_episode_timelapse(
                 xaxis=dict(range=[min_x, max_x], title="X"),
                 yaxis=dict(range=[min_y, max_y], title="Y"),
                 zaxis=dict(range=[min_z, max_z], title="Z / Altitude"),
-                aspectmode='data'
+                aspectmode='data',
+                camera=dict(
+                    up=dict(x=0, y=1, z=0),
+                    eye=dict(x=0, y=0.01, z=2.0) # looking straight down
+                )
             ),
             sliders=sliders,
             updatemenus=[dict(type='buttons', showactive=False, y=0, x=-0.05,
