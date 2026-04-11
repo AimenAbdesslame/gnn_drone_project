@@ -435,7 +435,7 @@ def generate_dataset(
 if __name__ == "__main__":
     # Generate A-formation dataset
     generate_dataset(
-        num_episodes=20,
+        num_episodes=400,
         max_steps=400,
         dataset_name="formation_a_comm_10m",
         dataset_type="a",
